@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import math
 import os
 import socket
 import stat
+import struct
 import sys
 import time
 from collections import Counter
@@ -19,6 +21,8 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 APP_NAME = "cgtool"
 APP_VERSION = "0.1.0"
+PROC_NET_DEV_HEADER_LINES = 2
+SIOCGIFADDR = 0x8915
 
 
 @dataclass
@@ -96,21 +100,21 @@ def json_dump(data: Any) -> None:
     print(json.dumps(data, indent=2, ensure_ascii=False))
 
 
-def read_text(path: str | Path) -> Optional[str]:
+def read_text(path: Path) -> Optional[str]:
     try:
-        return Path(path).read_text(encoding="utf-8").strip()
+        return path.read_text(encoding="utf-8").strip()
     except (FileNotFoundError, PermissionError, OSError, UnicodeDecodeError):
         return None
 
 
-def read_bytes(path: str | Path) -> Optional[bytes]:
+def read_bytes(path: Path) -> Optional[bytes]:
     try:
-        return Path(path).read_bytes()
+        return path.read_bytes()
     except (FileNotFoundError, PermissionError, OSError):
         return None
 
 
-def read_int(path: str | Path) -> Optional[int]:
+def read_int(path: Path) -> Optional[int]:
     value = read_text(path)
     if value is None:
         return None
@@ -122,12 +126,17 @@ def read_int(path: str | Path) -> Optional[int]:
 
 def get_ipv4_for_iface(iface: str) -> Optional[str]:
     try:
-        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
-        for info in infos:
-            addr = info[4][0]
-            if addr and not addr.startswith("127."):
-                return addr
-    except OSError:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            ifreq = struct.pack('16s', iface.encode()[:15])
+            addr = fcntl.ioctl(sock.fileno(), SIOCGIFADDR, ifreq)
+            ip = socket.inet_ntoa(addr[20:24])
+            return ip
+        except OSError:
+            pass
+        finally:
+            sock.close()
+    except (ImportError, OSError):
         pass
 
     try:
@@ -148,11 +157,11 @@ def get_interfaces() -> List[str]:
 
 def parse_proc_net_dev() -> Dict[str, Dict[str, int]]:
     result: Dict[str, Dict[str, int]] = {}
-    text = read_text("/proc/net/dev")
+    text = read_text(Path("/proc/net/dev"))
     if not text:
         return result
     lines = text.splitlines()
-    for line in lines[2:]:
+    for line in lines[PROC_NET_DEV_HEADER_LINES:]:
         if ":" not in line:
             continue
         left, right = line.split(":", 1)
@@ -185,7 +194,7 @@ def collect_net(ifaces: Optional[List[str]] = None) -> List[NetSnapshot]:
         snapshots.append(
             NetSnapshot(
                 iface=iface,
-                operstate=read_text(f"/sys/class/net/{iface}/operstate") or "unknown",
+                operstate=read_text(Path(f"/sys/class/net/{iface}/operstate")) or "unknown",
                 ipv4=get_ipv4_for_iface(iface),
                 rx_bytes=stats.get("rx_bytes", 0),
                 tx_bytes=stats.get("tx_bytes", 0),
@@ -235,11 +244,21 @@ def read_proc_stat() -> Dict[int, ProcSnapshot]:
         if not entry.name.isdigit():
             continue
         pid = int(entry.name)
-        stat_text = read_text(entry / "stat")
-        statm_text = read_text(entry / "statm")
-        cmdline_raw = read_bytes(entry / "cmdline")
+        
+        stat_path = entry / "stat"
+        statm_path = entry / "statm"
+        cmdline_path = entry / "cmdline"
+        
+        if not stat_path.exists() or not statm_path.exists():
+            continue
+            
+        stat_text = read_text(stat_path)
+        statm_text = read_text(statm_path)
+        cmdline_raw = read_bytes(cmdline_path)
+        
         if not stat_text or not statm_text:
             continue
+            
         try:
             left = stat_text.index("(")
             right = stat_text.rindex(")")
@@ -275,7 +294,7 @@ def read_proc_stat() -> Dict[int, ProcSnapshot]:
 
 
 def print_proc_table(current: Dict[int, ProcSnapshot], previous: Optional[Dict[int, ProcSnapshot]], elapsed: float, limit: int, sort_by: str) -> None:
-    hz = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+    hz = os.sysconf("SC_CLK_TCK")
     rows: List[Tuple[float, ProcSnapshot]] = []
     for pid, proc in current.items():
         prev = previous.get(pid) if previous else None
@@ -306,61 +325,109 @@ def print_proc_table(current: Dict[int, ProcSnapshot], previous: Optional[Dict[i
 
 
 def iter_disk(path: Path, max_depth: int, follow_symlinks: bool) -> Iterator[DiskEntry]:
-    base_depth = len(path.resolve().parts) if path.exists() else len(path.parts)
+    visited = set()
 
-    def walk(p: Path) -> Iterator[DiskEntry]:
+    def walk(p: Path, current_depth: int) -> Iterator[DiskEntry]:
+        if max_depth >= 0 and current_depth > max_depth:
+            return
+
         try:
-            st = p.stat(follow_symlinks=follow_symlinks)
+            if follow_symlinks:
+                st = p.stat()
+                real_path = p.resolve()
+            else:
+                st = p.lstat()
+                real_path = p
         except (PermissionError, FileNotFoundError, OSError):
             return
-        depth = len(p.resolve().parts) - base_depth if p.exists() else 0
-        if max_depth >= 0 and depth > max_depth:
+
+        if not follow_symlinks and st.st_mode & stat.S_IFLNK:
+            yield DiskEntry(
+                path=str(p),
+                kind="link",
+                size=st.st_size,
+                mode=stat.filemode(st.st_mode),
+                mtime=st.st_mtime,
+            )
             return
+
         mode = stat.filemode(st.st_mode)
         if stat.S_ISDIR(st.st_mode):
             kind = "dir"
-        elif stat.S_ISREG(st.st_mode):
-            kind = "file"
-        elif stat.S_ISLNK(st.st_mode):
-            kind = "link"
-        elif stat.S_ISCHR(st.st_mode):
-            kind = "char"
-        elif stat.S_ISBLK(st.st_mode):
-            kind = "block"
-        elif stat.S_ISFIFO(st.st_mode):
-            kind = "fifo"
-        elif stat.S_ISSOCK(st.st_mode):
-            kind = "sock"
-        else:
-            kind = "other"
-        yield DiskEntry(
-            path=str(p),
-            kind=kind,
-            size=st.st_size,
-            mode=mode,
-            mtime=st.st_mtime,
-        )
-        if kind == "dir":
+            yield DiskEntry(
+                path=str(p),
+                kind=kind,
+                size=st.st_size,
+                mode=mode,
+                mtime=st.st_mtime,
+            )
             try:
                 for child in sorted(p.iterdir(), key=lambda x: x.name):
-                    if child.is_symlink() and not follow_symlinks:
-                        try:
-                            lst = child.lstat()
-                            yield DiskEntry(
-                                path=str(child),
-                                kind="link",
-                                size=lst.st_size,
-                                mode=stat.filemode(lst.st_mode),
-                                mtime=lst.st_mtime,
-                            )
-                        except (PermissionError, FileNotFoundError, OSError):
-                            continue
-                    else:
-                        yield from walk(child)
+                    child_resolved = child.resolve() if follow_symlinks else child
+                    child_key = str(child_resolved)
+                    if child_key in visited:
+                        continue
+                    visited.add(child_key)
+                    yield from walk(child, current_depth + 1)
             except (PermissionError, FileNotFoundError, OSError):
                 return
+        elif stat.S_ISREG(st.st_mode):
+            kind = "file"
+            yield DiskEntry(
+                path=str(p),
+                kind=kind,
+                size=st.st_size,
+                mode=mode,
+                mtime=st.st_mtime,
+            )
+        elif stat.S_ISCHR(st.st_mode):
+            kind = "char"
+            yield DiskEntry(
+                path=str(p),
+                kind=kind,
+                size=st.st_size,
+                mode=mode,
+                mtime=st.st_mtime,
+            )
+        elif stat.S_ISBLK(st.st_mode):
+            kind = "block"
+            yield DiskEntry(
+                path=str(p),
+                kind=kind,
+                size=st.st_size,
+                mode=mode,
+                mtime=st.st_mtime,
+            )
+        elif stat.S_ISFIFO(st.st_mode):
+            kind = "fifo"
+            yield DiskEntry(
+                path=str(p),
+                kind=kind,
+                size=st.st_size,
+                mode=mode,
+                mtime=st.st_mtime,
+            )
+        elif stat.S_ISSOCK(st.st_mode):
+            kind = "sock"
+            yield DiskEntry(
+                path=str(p),
+                kind=kind,
+                size=st.st_size,
+                mode=mode,
+                mtime=st.st_mtime,
+            )
+        else:
+            kind = "other"
+            yield DiskEntry(
+                path=str(p),
+                kind=kind,
+                size=st.st_size,
+                mode=mode,
+                mtime=st.st_mtime,
+            )
 
-    yield from walk(path)
+    visited.add(str(path.resolve()))
+    yield from walk(path, 0)
 
 
 def print_disk_table(entries: Iterable[DiskEntry], limit: int, sort_by: str) -> None:
@@ -434,6 +501,10 @@ def print_entropy_report(report: EntropyReport) -> None:
         print(f"  0x{byte_value:02x}  {count}")
 
 
+def clear_screen() -> None:
+    print("\033[2J\033[H", end="")
+
+
 def cmd_version(_args: argparse.Namespace) -> int:
     print(f"{APP_NAME} {APP_VERSION}")
     return 0
@@ -455,7 +526,7 @@ def cmd_net(args: argparse.Namespace) -> int:
             now = time.monotonic()
             elapsed = now - previous_ts
             if args.clear:
-                os.system("clear")
+                clear_screen()
             if args.json:
                 payload = {
                     "elapsed": elapsed,
@@ -489,7 +560,7 @@ def cmd_proc(args: argparse.Namespace) -> int:
                 row = asdict(item)
                 if previous and elapsed > 0 and pid in previous:
                     delta = item.total_ticks - previous[pid].total_ticks
-                    hz = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+                    hz = os.sysconf("SC_CLK_TCK")
                     row["cpu_pct"] = max((delta / hz) / elapsed * 100.0, 0.0)
                 else:
                     row["cpu_pct"] = 0.0
@@ -505,7 +576,7 @@ def cmd_proc(args: argparse.Namespace) -> int:
             now = time.monotonic()
             elapsed = (now - previous_ts) if previous_ts is not None else 0.0
             if args.clear and cycles > 0:
-                os.system("clear")
+                clear_screen()
             emit(current, elapsed)
             previous = current
             previous_ts = now
@@ -526,10 +597,12 @@ def cmd_disk(args: argparse.Namespace) -> int:
     if not root.exists():
         print(f"path not found: {root}", file=sys.stderr)
         return 1
-    entries = list(iter_disk(root, args.max_depth, args.follow_symlinks))
+    
     if args.json:
+        entries = list(iter_disk(root, args.max_depth, args.follow_symlinks))
         json_dump([asdict(x) for x in entries[:args.limit]])
     else:
+        entries = iter_disk(root, args.max_depth, args.follow_symlinks)
         print_disk_table(entries, args.limit, args.sort)
     return 0
 
