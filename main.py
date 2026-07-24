@@ -6,6 +6,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import logging
 import math
 import os
 import socket
@@ -23,6 +24,27 @@ APP_NAME = "cgtool"
 APP_VERSION = "0.1.0"
 PROC_NET_DEV_HEADER_LINES = 2
 SIOCGIFADDR = 0x8915
+DEFAULT_INTERVAL = 2.0
+DEFAULT_LIMIT = 20
+DEFAULT_CHUNK_SIZE = 1024 * 1024
+DEFAULT_MAX_DEPTH = 2
+BYTES_PER_KIB = 1024
+BYTES_PER_MIB = 1024 * 1024
+BYTES_PER_GIB = 1024 * 1024 * 1024
+BYTES_PER_TIB = 1024 * 1024 * 1024 * 1024
+BYTES_PER_PIB = 1024 * 1024 * 1024 * 1024 * 1024
+UNITS = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+PPS_MILLION = 1_000_000
+PPS_THOUSAND = 1_000
+PRINTABLE_MIN = 32
+PRINTABLE_MAX = 126
+WHITESPACE_CHARS = (9, 10, 13)
+DNS_SERVER = "8.8.8.8"
+DNS_PORT = 80
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -76,12 +98,11 @@ class EntropyReport:
 
 
 def human_bytes(value: float) -> str:
-    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
     idx = 0
-    while value >= 1024 and idx < len(units) - 1:
-        value /= 1024.0
+    while value >= BYTES_PER_KIB and idx < len(UNITS) - 1:
+        value /= BYTES_PER_KIB
         idx += 1
-    return f"{value:.2f} {units[idx]}"
+    return f"{value:.2f} {UNITS[idx]}"
 
 
 def human_rate(value: float) -> str:
@@ -89,10 +110,10 @@ def human_rate(value: float) -> str:
 
 
 def format_pps(value: float) -> str:
-    if value >= 1_000_000:
-        return f"{value / 1_000_000:.2f} Mpps"
-    if value >= 1_000:
-        return f"{value / 1_000:.2f} Kpps"
+    if value >= PPS_MILLION:
+        return f"{value / PPS_MILLION:.2f} Mpps"
+    if value >= PPS_THOUSAND:
+        return f"{value / PPS_THOUSAND:.2f} Kpps"
     return f"{value:.2f} pps"
 
 
@@ -103,14 +124,16 @@ def json_dump(data: Any) -> None:
 def read_text(path: Path) -> Optional[str]:
     try:
         return path.read_text(encoding="utf-8").strip()
-    except (FileNotFoundError, PermissionError, OSError, UnicodeDecodeError):
+    except (FileNotFoundError, PermissionError, OSError, UnicodeDecodeError) as e:
+        logger.debug(f"Failed to read text from {path}: {e}")
         return None
 
 
 def read_bytes(path: Path) -> Optional[bytes]:
     try:
         return path.read_bytes()
-    except (FileNotFoundError, PermissionError, OSError):
+    except (FileNotFoundError, PermissionError, OSError) as e:
+        logger.debug(f"Failed to read bytes from {path}: {e}")
         return None
 
 
@@ -120,7 +143,8 @@ def read_int(path: Path) -> Optional[int]:
         return None
     try:
         return int(value)
-    except ValueError:
+    except ValueError as e:
+        logger.debug(f"Failed to parse int from {path}: {e}")
         return None
 
 
@@ -128,22 +152,24 @@ def get_ipv4_for_iface(iface: str) -> Optional[str]:
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            ifreq = struct.pack('16s', iface.encode()[:15])
+            iface_bytes = iface.encode()[:15]
+            ifreq = struct.pack('16s', iface_bytes)
             addr = fcntl.ioctl(sock.fileno(), SIOCGIFADDR, ifreq)
             ip = socket.inet_ntoa(addr[20:24])
             return ip
-        except OSError:
-            pass
+        except OSError as e:
+            logger.debug(f"IOCTL failed for {iface}: {e}")
         finally:
             sock.close()
-    except (ImportError, OSError):
-        pass
+    except (ImportError, OSError) as e:
+        logger.debug(f"Socket setup failed: {e}")
 
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
+            s.connect((DNS_SERVER, DNS_PORT))
             return s.getsockname()[0]
-    except OSError:
+    except OSError as e:
+        logger.debug(f"Fallback IP detection failed: {e}")
         return None
 
 
@@ -151,7 +177,8 @@ def get_interfaces() -> List[str]:
     base = Path("/sys/class/net")
     try:
         return sorted(p.name for p in base.iterdir() if p.exists())
-    except OSError:
+    except OSError as e:
+        logger.debug(f"Failed to list interfaces: {e}")
         return []
 
 
@@ -180,7 +207,8 @@ def parse_proc_net_dev() -> Dict[str, Dict[str, int]]:
                 "tx_errs": int(parts[10]),
                 "tx_drop": int(parts[11]),
             }
-        except ValueError:
+        except ValueError as e:
+            logger.debug(f"Failed to parse /proc/net/dev line for {iface}: {e}")
             continue
     return result
 
@@ -288,7 +316,8 @@ def read_proc_stat() -> Dict[int, ProcSnapshot]:
                 total_ticks=utime_ticks + stime_ticks,
                 cmdline=cmdline or name,
             )
-        except (ValueError, IndexError):
+        except (ValueError, IndexError, PermissionError) as e:
+            logger.debug(f"Failed to parse /proc/{pid}/stat: {e}")
             continue
     return result
 
@@ -326,6 +355,7 @@ def print_proc_table(current: Dict[int, ProcSnapshot], previous: Optional[Dict[i
 
 def iter_disk(path: Path, max_depth: int, follow_symlinks: bool) -> Iterator[DiskEntry]:
     visited = set()
+    symlink_chain = set()
 
     def walk(p: Path, current_depth: int) -> Iterator[DiskEntry]:
         if max_depth >= 0 and current_depth > max_depth:
@@ -333,15 +363,21 @@ def iter_disk(path: Path, max_depth: int, follow_symlinks: bool) -> Iterator[Dis
 
         try:
             if follow_symlinks:
-                st = p.stat()
                 real_path = p.resolve()
+                if current_depth > 0:
+                    resolved_str = str(real_path)
+                    if resolved_str in symlink_chain:
+                        return
+                    symlink_chain.add(resolved_str)
+                st = real_path.stat()
             else:
                 st = p.lstat()
                 real_path = p
-        except (PermissionError, FileNotFoundError, OSError):
+        except (PermissionError, FileNotFoundError, OSError) as e:
+            logger.debug(f"Cannot access {p}: {e}")
             return
 
-        if not follow_symlinks and st.st_mode & stat.S_IFLNK:
+        if not follow_symlinks and stat.S_ISLNK(st.st_mode):
             yield DiskEntry(
                 path=str(p),
                 kind="link",
@@ -369,7 +405,8 @@ def iter_disk(path: Path, max_depth: int, follow_symlinks: bool) -> Iterator[Dis
                         continue
                     visited.add(child_key)
                     yield from walk(child, current_depth + 1)
-            except (PermissionError, FileNotFoundError, OSError):
+            except (PermissionError, FileNotFoundError, OSError) as e:
+                logger.debug(f"Cannot read directory {p}: {e}")
                 return
         elif stat.S_ISREG(st.st_mode):
             kind = "file"
@@ -459,7 +496,7 @@ def shannon_entropy(counter: Counter[int], total: int) -> float:
     return entropy
 
 
-def analyze_file(path: Path, chunk_size: int = 1024 * 1024) -> EntropyReport:
+def analyze_file(path: Path, chunk_size: int = DEFAULT_CHUNK_SIZE) -> EntropyReport:
     sha256 = hashlib.sha256()
     counter: Counter[int] = Counter()
     total = 0
@@ -474,7 +511,7 @@ def analyze_file(path: Path, chunk_size: int = 1024 * 1024) -> EntropyReport:
             sha256.update(chunk)
             total += len(chunk)
             counter.update(chunk)
-            printable += sum(1 for b in chunk if 32 <= b <= 126 or b in (9, 10, 13))
+            printable += sum(1 for b in chunk if PRINTABLE_MIN <= b <= PRINTABLE_MAX or b in WHITESPACE_CHARS)
             nulls += chunk.count(0)
 
     top_bytes = counter.most_common(10)
@@ -505,12 +542,22 @@ def clear_screen() -> None:
     print("\033[2J\033[H", end="")
 
 
+def validate_positive_interval(interval: float) -> bool:
+    if interval <= 0:
+        print("Interval must be positive", file=sys.stderr)
+        return False
+    return True
+
+
 def cmd_version(_args: argparse.Namespace) -> int:
     print(f"{APP_NAME} {APP_VERSION}")
     return 0
 
 
 def cmd_net(args: argparse.Namespace) -> int:
+    if not validate_positive_interval(args.interval):
+        return 1
+    
     ifaces = args.iface or None
     if args.watch:
         previous = collect_net(ifaces)
@@ -550,6 +597,9 @@ def cmd_net(args: argparse.Namespace) -> int:
 
 
 def cmd_proc(args: argparse.Namespace) -> int:
+    if not validate_positive_interval(args.interval):
+        return 1
+    
     previous: Optional[Dict[int, ProcSnapshot]] = None
     previous_ts: Optional[float] = None
 
@@ -635,7 +685,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_net = subparsers.add_parser("net", help="network interface monitor")
     p_net.add_argument("--iface", action="append", help="select interface")
     p_net.add_argument("--watch", action="store_true", help="watch mode")
-    p_net.add_argument("--interval", type=float, default=2.0, help="refresh interval")
+    p_net.add_argument("--interval", type=float, default=DEFAULT_INTERVAL, help="refresh interval")
     p_net.add_argument("--count", type=int, default=0, help="number of cycles, 0 = infinite")
     p_net.add_argument("--json", action="store_true", help="json output")
     p_net.add_argument("--clear", action="store_true", help="clear screen between updates")
@@ -643,9 +693,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_proc = subparsers.add_parser("proc", help="process snapshot")
     p_proc.add_argument("--watch", action="store_true", help="watch mode")
-    p_proc.add_argument("--interval", type=float, default=2.0, help="refresh interval")
+    p_proc.add_argument("--interval", type=float, default=DEFAULT_INTERVAL, help="refresh interval")
     p_proc.add_argument("--count", type=int, default=0, help="number of cycles, 0 = infinite")
-    p_proc.add_argument("--limit", type=int, default=20, help="row limit")
+    p_proc.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help="row limit")
     p_proc.add_argument("--sort", choices=["cpu", "rss", "pid", "name"], default="cpu", help="sort field")
     p_proc.add_argument("--json", action="store_true", help="json output")
     p_proc.add_argument("--clear", action="store_true", help="clear screen between updates")
@@ -655,14 +705,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_disk.add_argument("path", nargs="?", default=".", help="target path")
     p_disk.add_argument("--limit", type=int, default=50, help="row limit")
     p_disk.add_argument("--sort", choices=["path", "size", "mtime", "kind"], default="path", help="sort field")
-    p_disk.add_argument("--max-depth", type=int, default=2, help="max traversal depth, -1 = unlimited")
+    p_disk.add_argument("--max-depth", type=int, default=DEFAULT_MAX_DEPTH, help="max traversal depth, -1 = unlimited")
     p_disk.add_argument("--follow-symlinks", action="store_true", help="follow symlinks")
     p_disk.add_argument("--json", action="store_true", help="json output")
     p_disk.set_defaults(func=cmd_disk)
 
     p_entropy = subparsers.add_parser("entropy", help="file entropy report")
     p_entropy.add_argument("path", help="target file")
-    p_entropy.add_argument("--chunk-size", type=int, default=1024 * 1024, help="read chunk size")
+    p_entropy.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="read chunk size")
     p_entropy.add_argument("--json", action="store_true", help="json output")
     p_entropy.set_defaults(func=cmd_entropy)
 
@@ -676,7 +726,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.version:
         return cmd_version(args)
 
-    if not getattr(args, "command", None):
+    if not hasattr(args, "func"):
         parser.print_help()
         return 0
 
