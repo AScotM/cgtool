@@ -24,7 +24,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 
 APP_NAME = "cgtool"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 
 PROC_NET_DEV_HEADER_LINES = 2
 SIOCGIFADDR = 0x8915
@@ -304,7 +304,7 @@ def sleep_interruptible(seconds: float) -> None:
 
 
 def validate_positive_interval(interval: float) -> bool:
-    if interval <= 0:
+    if not math.isfinite(interval) or interval <= 0:
         print("interval must be positive", file=sys.stderr)
         return False
 
@@ -316,6 +316,20 @@ def validate_limit(limit: int) -> bool:
         print("limit must be zero or greater", file=sys.stderr)
         return False
 
+    return True
+
+
+def validate_count(count: int) -> bool:
+    if count < 0:
+        print("count must be zero or greater", file=sys.stderr)
+        return False
+    return True
+
+
+def validate_port(port: Optional[int]) -> bool:
+    if port is not None and not 0 <= port <= 65535:
+        print("port must be between 0 and 65535", file=sys.stderr)
+        return False
     return True
 
 
@@ -344,7 +358,8 @@ def get_interfaces() -> List[str]:
 
     try:
         return sorted(entry.name for entry in base.iterdir())
-    except OSError:
+    except OSError as exc:
+        logger.warning("Cannot enumerate network interfaces: %s", exc)
         return []
 
 
@@ -352,7 +367,8 @@ def parse_proc_net_dev() -> Dict[str, Dict[str, int]]:
     result: Dict[str, Dict[str, int]] = {}
     text = read_text(Path("/proc/net/dev"))
 
-    if not text:
+    if text is None:
+        logger.warning("Network counters could not be read from /proc/net/dev")
         return result
 
     lines = text.splitlines()
@@ -435,6 +451,8 @@ def net_rows(
         tx_pps = 0.0
 
         if prev is not None and elapsed > 0:
+            if item.rx_bytes < prev.rx_bytes or item.tx_bytes < prev.tx_bytes:
+                logger.warning("Network counters reset on %s", item.iface)
             rx_rate = max(
                 (item.rx_bytes - prev.rx_bytes) / elapsed,
                 0.0,
@@ -577,7 +595,8 @@ def read_proc_stat() -> Dict[int, ProcSnapshot]:
 
     try:
         entries = list(proc.iterdir())
-    except OSError:
+    except OSError as exc:
+        logger.warning("Cannot enumerate processes: %s", exc)
         return result
 
     for entry in entries:
@@ -775,15 +794,15 @@ def iter_disk(
             return
 
         try:
-            st = (
-                current.stat()
-                if follow_symlinks
-                else current.lstat()
-            )
-        except (PermissionError, FileNotFoundError, OSError):
+            link_stat = current.lstat()
+            is_link = stat.S_ISLNK(link_stat.st_mode)
+            st = current.stat() if follow_symlinks else link_stat
+        except (PermissionError, FileNotFoundError, OSError) as exc:
+            logger.warning("Cannot inspect %s: %s", current, exc)
             return
 
-        kind = disk_kind(st.st_mode)
+        kind = "link" if is_link else disk_kind(st.st_mode)
+        target_is_dir = stat.S_ISDIR(st.st_mode)
 
         yield DiskEntry(
             path=str(current),
@@ -796,18 +815,8 @@ def iter_disk(
             inode=st.st_ino,
         )
 
-        if kind != "dir":
-            if not (
-                follow_symlinks
-                and current.is_symlink()
-            ):
-                return
-
-            try:
-                if not current.resolve().is_dir():
-                    return
-            except OSError:
-                return
+        if not target_is_dir:
+            return
 
         try:
             target_stat = current.stat()
@@ -834,7 +843,8 @@ def iter_disk(
             FileNotFoundError,
             NotADirectoryError,
             OSError,
-        ):
+        ) as exc:
+            logger.warning("Cannot list %s: %s", current, exc)
             return
 
         for child in children:
@@ -1270,7 +1280,8 @@ def unescape_mount_field(value: str) -> str:
 def collect_mounts() -> List[MountEntry]:
     text = read_text(Path("/proc/self/mounts"))
 
-    if not text:
+    if text is None:
+        logger.warning("Cannot read /proc/self/mounts")
         return []
 
     rows: List[MountEntry] = []
@@ -1508,7 +1519,8 @@ def parse_inet_socket_file(
 ) -> List[SocketEntry]:
     text = read_text(path)
 
-    if not text:
+    if text is None:
+        logger.warning("Cannot read %s", path)
         return []
 
     rows: List[SocketEntry] = []
@@ -1764,15 +1776,14 @@ def cmd_system(
 def cmd_net(
     args: argparse.Namespace,
 ) -> int:
-    if not validate_positive_interval(
-        args.interval
-    ):
+    if not validate_positive_interval(args.interval) or not validate_count(args.count):
         return 1
 
     selected = args.iface or None
 
-    previous: Optional[List[NetSnapshot]] = None
-    previous_ts: Optional[float] = None
+    previous: Optional[List[NetSnapshot]] = collect_net(selected)
+    previous_ts: Optional[float] = time.monotonic()
+    sleep_interruptible(args.interval)
 
     cycles = 0
 
@@ -1839,7 +1850,7 @@ def cmd_proc(
     ):
         return 1
 
-    if not validate_limit(args.limit):
+    if not validate_limit(args.limit) or not validate_count(args.count):
         return 1
 
     previous: Optional[
@@ -1848,6 +1859,10 @@ def cmd_proc(
 
     previous_ts: Optional[float] = None
     cycles = 0
+
+    previous = read_proc_stat()
+    previous_ts = time.monotonic()
+    sleep_interruptible(args.interval)
 
     while not _stop_requested:
         current = read_proc_stat()
@@ -2099,6 +2114,9 @@ def cmd_sockets(
     if not validate_limit(args.limit):
         return 1
 
+    if not validate_port(args.port):
+        return 1
+
     protocols: Set[str] = set()
 
     if args.tcp:
@@ -2147,7 +2165,7 @@ def cmd_sockets(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=APP_NAME,
-        description="Cyber Garden Toolkit",
+        description="Cybernetic Garden Linux Diagnostics Toolkit",
     )
 
     parser.add_argument(
