@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import collections
+import datetime
+import tempfile
 import fcntl
 import hashlib
 import json
@@ -24,7 +27,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 
 APP_NAME = "cgtool"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 
 PROC_NET_DEV_HEADER_LINES = 2
 SIOCGIFADDR = 0x8915
@@ -2162,6 +2165,472 @@ def cmd_sockets(
     return 0
 
 
+
+
+def read_key_values(path: Path, separator: str = ":") -> Dict[str, str]:
+    output: Dict[str, str] = {}
+    raw = read_text(path)
+    if raw is None:
+        return output
+    for line in raw.splitlines():
+        if separator not in line:
+            continue
+        key, value = line.split(separator, 1)
+        output[key.strip()] = value.strip()
+    return output
+
+
+def numeric_value(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value.split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def read_psi() -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    for resource in ("cpu", "memory", "io"):
+        raw = read_text(Path("/proc/pressure") / resource)
+        if raw is None:
+            continue
+        metrics: Dict[str, Any] = {}
+        for line in raw.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            values: Dict[str, Any] = {}
+            for part in parts[1:]:
+                if "=" not in part:
+                    continue
+                key, value = part.split("=", 1)
+                try:
+                    values[key] = int(value) if key == "total" else float(value)
+                except ValueError:
+                    pass
+            metrics[parts[0]] = values
+        result[resource] = metrics
+    return result
+
+
+def read_vmstat() -> Dict[str, int]:
+    result: Dict[str, int] = {}
+    raw = read_text(Path("/proc/vmstat"))
+    if raw:
+        for line in raw.splitlines():
+            parts = line.split()
+            if len(parts) == 2:
+                try:
+                    result[parts[0]] = int(parts[1])
+                except ValueError:
+                    continue
+    return result
+
+
+def read_buddyinfo() -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    raw = read_text(Path("/proc/buddyinfo"))
+    if not raw:
+        return result
+    for line in raw.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0] != "Node":
+            continue
+        try:
+            node = int(parts[1].rstrip(","))
+            zone = parts[3]
+            orders = [int(x) for x in parts[4:]]
+        except ValueError:
+            continue
+        result.append({"node": node, "zone": zone, "orders": orders,
+                       "free_pages": sum(count * (1 << i) for i, count in enumerate(orders)),
+                       "highest_nonempty_order": max((i for i, x in enumerate(orders) if x), default=-1)})
+    return result
+
+
+def read_slabinfo(limit: int = 20) -> List[Dict[str, Any]]:
+    raw = read_text(Path("/proc/slabinfo"))
+    if not raw:
+        return []
+    entries: List[Dict[str, Any]] = []
+    for line in raw.splitlines()[2:]:
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            active, total, size = map(int, parts[1:4])
+        except ValueError:
+            continue
+        entries.append({"name": parts[0], "active_objects": active,
+                        "total_objects": total, "object_size": size,
+                        "allocated_bytes_estimate": total * size})
+    entries.sort(key=lambda x: x["allocated_bytes_estimate"], reverse=True)
+    return entries[:limit] if limit else entries
+
+
+def read_numa() -> Dict[str, Any]:
+    nodes: Dict[str, Any] = {}
+    base = Path("/sys/devices/system/node")
+    try:
+        candidates = sorted(base.glob("node[0-9]*"))
+    except OSError:
+        return nodes
+    for node in candidates:
+        stats = read_key_values(node / "meminfo")
+        memory: Dict[str, int] = {}
+        for key, value in stats.items():
+            cleaned = key.replace("Node " + node.name[4:] + " ", "")
+            number = numeric_value(value)
+            if number is not None:
+                memory[cleaned] = number * 1024 if value.endswith("kB") else number
+        nodes[node.name] = {"memory": memory,
+                            "cpulist": read_text(node / "cpulist"),
+                            "distance": read_text(node / "distance")}
+    return nodes
+
+
+def memory_forensics(slab_limit: int = 20) -> Dict[str, Any]:
+    return {"timestamp": time.time(), "memory_bytes": read_meminfo(),
+            "pressure": read_psi(), "vmstat": read_vmstat(),
+            "buddyinfo": read_buddyinfo(), "slabs": read_slabinfo(slab_limit),
+            "numa": read_numa()}
+
+
+def process_forensics(pid: int) -> Dict[str, Any]:
+    base = Path("/proc") / str(pid)
+    if not base.exists():
+        raise FileNotFoundError(str(base))
+    snap = parse_proc_pid(pid)
+    status = read_key_values(base / "status")
+    io = read_key_values(base / "io")
+    sched = read_key_values(base / "sched")
+    limits_raw = read_text(base / "limits")
+    cgroups_raw = read_text(base / "cgroup")
+    ns: Dict[str, str] = {}
+    try:
+        for entry in (base / "ns").iterdir():
+            try:
+                ns[entry.name] = os.readlink(entry)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    fd_count: Optional[int] = None
+    try:
+        fd_count = len(os.listdir(base / "fd"))
+    except OSError:
+        pass
+    return {"timestamp": time.time(), "pid": pid,
+            "snapshot": asdict(snap) if snap else None,
+            "status": status, "io": {k: numeric_value(v) for k, v in io.items()},
+            "scheduling": {"policy": read_text(base / "sched"),
+                           "priority": status.get("Cpus_allowed_list"),
+                           "scheduler_statistics": sched},
+            "cgroups": cgroups_raw.splitlines() if cgroups_raw else [],
+            "namespaces": ns, "open_file_descriptors": fd_count,
+            "limits": limits_raw.splitlines() if limits_raw else [],
+            "oom_score": read_int(base / "oom_score"),
+            "oom_score_adj": read_int(base / "oom_score_adj"),
+            "context_switches": {"voluntary": numeric_value(status.get("voluntary_ctxt_switches")),
+                                 "nonvoluntary": numeric_value(status.get("nonvoluntary_ctxt_switches"))}}
+
+
+def inode_forensics() -> Dict[str, Any]:
+    results: List[Dict[str, Any]] = []
+    seen: Set[Tuple[int, int]] = set()
+    for mount in collect_mounts():
+        try:
+            st = os.stat(mount.target)
+            identity = (st.st_dev, os.statvfs(mount.target).f_fsid)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            fs = os.statvfs(mount.target)
+        except (OSError, AttributeError):
+            continue
+        total, free, avail = fs.f_files, fs.f_ffree, fs.f_favail
+        used = max(total - free, 0)
+        results.append({"mount": mount.target, "source": mount.source,
+                        "filesystem": mount.fstype, "inodes_total": total,
+                        "inodes_used": used, "inodes_free": free,
+                        "inodes_available": avail,
+                        "inodes_used_pct": round(100 * used / total, 2) if total else None})
+    results.sort(key=lambda x: (x["inodes_used_pct"] or 0), reverse=True)
+    return {"timestamp": time.time(), "filesystems": results}
+
+
+def network_forensics() -> Dict[str, Any]:
+    stats: Dict[str, Dict[str, int]] = {}
+    for source in ("/proc/net/snmp", "/proc/net/netstat"):
+        raw = read_text(Path(source))
+        if not raw:
+            continue
+        lines = raw.splitlines()
+        for index in range(0, len(lines) - 1, 2):
+            headings, values = lines[index].split(), lines[index + 1].split()
+            if not headings or not values or headings[0] != values[0]:
+                continue
+            section = headings[0].rstrip(":")
+            bucket = stats.setdefault(section, {})
+            for key, value in zip(headings[1:], values[1:]):
+                try:
+                    bucket[key] = int(value)
+                except ValueError:
+                    continue
+    tcp_states = dict(Counter(x.state for x in collect_sockets({"tcp"})))
+    interfaces = []
+    for item in collect_net():
+        row = asdict(item)
+        base = Path("/sys/class/net") / item.iface
+        row["speed_mbps"] = read_int(base / "speed")
+        row["carrier"] = read_int(base / "carrier")
+        row["duplex"] = read_text(base / "duplex")
+        interfaces.append(row)
+    return {"timestamp": time.time(), "protocol_counters": stats,
+            "tcp_states": tcp_states, "interfaces": interfaces}
+
+
+def snapshot_all() -> Dict[str, Any]:
+    return {"schema": "cgtool.snapshot.v1", "version": APP_VERSION,
+            "timestamp": time.time(), "system": asdict(collect_system()),
+            "pressure": read_psi(), "vmstat": read_vmstat(),
+            "network": network_forensics(), "inodes": inode_forensics(),
+            "mounts": [asdict(x) for x in collect_mounts()]}
+
+
+def save_snapshot(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".cgtool-", suffix=".json", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def load_snapshot(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict) or data.get("schema") != "cgtool.snapshot.v1":
+        raise ValueError("unsupported snapshot schema")
+    return data
+
+
+def diff_numbers(before: Any, after: Any, path: str = "") -> List[Dict[str, Any]]:
+    changes: List[Dict[str, Any]] = []
+    if isinstance(before, dict) and isinstance(after, dict):
+        for key in sorted(before.keys() & after.keys()):
+            changes.extend(diff_numbers(before[key], after[key], f"{path}.{key}" if path else key))
+    elif isinstance(before, (int, float)) and not isinstance(before, bool) and isinstance(after, (int, float)) and not isinstance(after, bool):
+        if before != after:
+            changes.append({"metric": path, "before": before, "after": after,
+                            "delta": after - before})
+    return changes
+
+
+def compare_snapshots(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    duration = b["timestamp"] - a["timestamp"]
+    if duration <= 0:
+        raise ValueError("snapshot timestamps must be increasing")
+    changes = diff_numbers(a, b)
+    for row in changes:
+        row["rate_per_second"] = row["delta"] / duration
+    return {"schema": "cgtool.diff.v1", "duration_seconds": duration,
+            "from": a["timestamp"], "to": b["timestamp"], "changes": changes}
+
+
+def health_findings(snapshot: Dict[str, Any], thresholds: argparse.Namespace) -> List[Dict[str, Any]]:
+    findings: List[Dict[str, Any]] = []
+    def add(level: str, component: str, metric: str, value: Any, threshold: Any, explanation: str) -> None:
+        findings.append({"severity": level, "component": component, "metric": metric,
+                         "value": value, "threshold": threshold, "explanation": explanation})
+    system = snapshot["system"]
+    total = system.get("mem_total") or 0
+    available = system.get("mem_available") or 0
+    if total:
+        used_pct = 100 * (total - available) / total
+        if used_pct >= thresholds.memory_pct:
+            add("warning", "memory", "used_pct", round(used_pct, 2), thresholds.memory_pct,
+                "Available memory is below the configured margin")
+    psi = snapshot.get("pressure", {})
+    for resource in ("cpu", "memory", "io"):
+        full = psi.get(resource, {}).get("full", {}).get("avg10")
+        some = psi.get(resource, {}).get("some", {}).get("avg10")
+        value = full if full is not None else some
+        if value is not None and value >= thresholds.psi_avg10:
+            add("warning", "pressure", resource + ".avg10", value, thresholds.psi_avg10,
+                "Sustained recent resource contention")
+    for fs in snapshot.get("inodes", {}).get("filesystems", []):
+        value = fs.get("inodes_used_pct")
+        if value is not None and value >= thresholds.inode_pct:
+            add("critical", "filesystem", fs["mount"] + ".inodes_used_pct", value,
+                thresholds.inode_pct, "Filesystem inode exhaustion risk")
+    for mount in snapshot.get("mounts", []):
+        if mount.get("fstype") in {"proc", "sysfs", "tmpfs", "devtmpfs", "cgroup2", "devpts", "overlay"}:
+            continue
+        value = mount.get("used_pct")
+        if value is not None and value >= thresholds.disk_pct:
+            add("warning", "filesystem", mount["target"] + ".used_pct", value,
+                thresholds.disk_pct, "Filesystem capacity is approaching its threshold")
+    for interface in snapshot.get("network", {}).get("interfaces", []):
+        for metric in ("rx_errs", "tx_errs", "rx_drop", "tx_drop"):
+            if interface.get(metric, 0) > 0:
+                add("info", "network", interface["iface"] + "." + metric,
+                    interface[metric], 0, "Nonzero cumulative interface counter; compare snapshots for trends")
+    severity = {"critical": 0, "warning": 1, "info": 2}
+    findings.sort(key=lambda x: (severity[x["severity"]], x["component"], x["metric"]))
+    return findings
+
+
+def print_nested_report(payload: Dict[str, Any], json_mode: bool) -> None:
+    if json_mode:
+        json_dump(payload)
+        return
+    def visit(value: Any, prefix: str = "") -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                visit(item, f"{prefix}.{key}" if prefix else key)
+        elif isinstance(value, list):
+            print(f"{prefix}: {len(value)} entries")
+            for index, item in enumerate(value[:20]):
+                visit(item, f"{prefix}[{index}]")
+            if len(value) > 20:
+                print(f"{prefix}: {len(value) - 20} additional entries omitted; use --json")
+        else:
+            print(f"{prefix:<56} {value}")
+    visit(payload)
+
+
+def cmd_memory_forensics(args: argparse.Namespace) -> int:
+    print_nested_report(memory_forensics(args.slab_limit), args.json)
+    return 0
+
+
+def cmd_process_forensics(args: argparse.Namespace) -> int:
+    try:
+        result = process_forensics(args.pid)
+    except (FileNotFoundError, PermissionError) as exc:
+        print(f"process inspection failed: {exc}", file=sys.stderr)
+        return 1
+    print_nested_report(result, args.json)
+    return 0
+
+
+def cmd_inodes(args: argparse.Namespace) -> int:
+    print_nested_report(inode_forensics(), args.json)
+    return 0
+
+
+def cmd_network_forensics(args: argparse.Namespace) -> int:
+    print_nested_report(network_forensics(), args.json)
+    return 0
+
+
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    data = snapshot_all()
+    if args.output:
+        save_snapshot(Path(args.output), data)
+        print(f"snapshot saved: {args.output}", file=sys.stderr)
+    print_nested_report(data, args.json) if not args.quiet else None
+    return 0
+
+
+def cmd_diff(args: argparse.Namespace) -> int:
+    data = compare_snapshots(load_snapshot(Path(args.before)), load_snapshot(Path(args.after)))
+    if args.filter:
+        data["changes"] = [x for x in data["changes"] if args.filter.lower() in x["metric"].lower()]
+    if args.limit:
+        data["changes"] = sorted(data["changes"], key=lambda x: abs(x["delta"]), reverse=True)[:args.limit]
+    print_nested_report(data, args.json)
+    return 0
+
+
+def cmd_health(args: argparse.Namespace) -> int:
+    snap = load_snapshot(Path(args.input)) if args.input else snapshot_all()
+    findings = health_findings(snap, args)
+    counts = dict(Counter(x["severity"] for x in findings))
+    result = {"timestamp": snap["timestamp"], "hostname": snap["system"]["hostname"],
+              "summary": counts, "findings": findings}
+    print_nested_report(result, args.json)
+    return 2 if args.fail_on_warning and (counts.get("warning") or counts.get("critical")) else 0
+
+
+def cmd_watch_health(args: argparse.Namespace) -> int:
+    if not validate_positive_interval(args.interval) or not validate_count(args.count):
+        return 1
+    cycles = 0
+    while not _stop_requested:
+        snap = snapshot_all()
+        findings = health_findings(snap, args)
+        result = {"timestamp": snap["timestamp"], "hostname": snap["system"]["hostname"],
+                  "findings": findings, "summary": dict(Counter(x["severity"] for x in findings))}
+        if args.output_dir:
+            filename = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S")
+            save_snapshot(Path(args.output_dir) / f"{filename}-{time.time_ns()}.json", snap)
+        print_nested_report(result, args.json)
+        cycles += 1
+        if args.count and cycles >= args.count:
+            break
+        sleep_interruptible(args.interval)
+    return 0
+
+
+def register_forensics_commands(subparsers: Any) -> None:
+    p = subparsers.add_parser("memory", help="memory pressure, NUMA, buddy allocator and slab forensics")
+    p.add_argument("--slab-limit", type=int, default=20)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_memory_forensics)
+
+    p = subparsers.add_parser("process", help="deep inspection of one process")
+    p.add_argument("pid", type=int)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_process_forensics)
+
+    p = subparsers.add_parser("inodes", help="filesystem inode capacity")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_inodes)
+
+    p = subparsers.add_parser("network", help="TCP and IP counters, socket states and interfaces")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_network_forensics)
+
+    p = subparsers.add_parser("snapshot", help="collect and optionally save a system baseline")
+    p.add_argument("--output")
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_snapshot)
+
+    p = subparsers.add_parser("diff", help="compare two system baselines")
+    p.add_argument("before")
+    p.add_argument("after")
+    p.add_argument("--filter")
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_diff)
+
+    for command, handler in (("health", cmd_health), ("watch-health", cmd_watch_health)):
+        p = subparsers.add_parser(command, help="cross-subsystem health findings")
+        p.add_argument("--memory-pct", type=float, default=90)
+        p.add_argument("--disk-pct", type=float, default=90)
+        p.add_argument("--inode-pct", type=float, default=90)
+        p.add_argument("--psi-avg10", type=float, default=20)
+        p.add_argument("--json", action="store_true")
+        if command == "health":
+            p.add_argument("--input")
+            p.add_argument("--fail-on-warning", action="store_true")
+        else:
+            p.add_argument("--interval", type=float, default=5)
+            p.add_argument("--count", type=int, default=0)
+            p.add_argument("--output-dir")
+        p.set_defaults(func=handler)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=APP_NAME,
@@ -2485,6 +2954,7 @@ def build_parser() -> argparse.ArgumentParser:
         func=cmd_sockets,
     )
 
+    register_forensics_commands(subparsers)
     return parser
 
 
@@ -2511,6 +2981,9 @@ def main(
         except OSError:
             pass
         return 0
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"cgtool: {exc}", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         return 130
 
